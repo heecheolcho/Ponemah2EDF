@@ -1,0 +1,24 @@
+name: build-converter
+on: [push, workflow_dispatch]
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install pyinstaller numpy
+      - run: pyinstaller --noconfirm --onefile --windowed --name Ponemah2EDF gui.py
+      - uses: actions/upload-artifact@v4
+        with: { name: Ponemah2EDF-Windows, path: dist/Ponemah2EDF.exe }
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install pyinstaller numpy
+      - run: pyinstaller --noconfirm --windowed --name Ponemah2EDF gui.py
+      - run: hdiutil create -volname "Ponemah2EDF" -srcfolder "dist/Ponemah2EDF.app" -ov -format UDZO Ponemah2EDF.dmg
+      - uses: actions/upload-artifact@v4
+        with: { name: Ponemah2EDF-macOS, path: Ponemah2EDF.dmg }
