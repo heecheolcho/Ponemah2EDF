@@ -1,4 +1,4 @@
-name: build-converter
+name: build-apps
 on: [push, workflow_dispatch]
 jobs:
   windows:
@@ -7,18 +7,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: pip install pyinstaller numpy
+      - run: pip install pyinstaller numpy pywebview
       - run: pyinstaller --noconfirm --onefile --windowed --name Ponemah2EDF gui.py
+      - run: pyinstaller --noconfirm --onefile --windowed --name EDF_Viewer_App --add-data "EDF_Viewer.html;." --collect-all webview EDFViewerApp.py
       - uses: actions/upload-artifact@v4
-        with: { name: Ponemah2EDF-Windows, path: dist/Ponemah2EDF.exe }
+        with: { name: Windows-Apps, path: dist/*.exe }
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: pip install pyinstaller numpy
+      - run: pip install pyinstaller numpy pywebview
       - run: pyinstaller --noconfirm --windowed --name Ponemah2EDF gui.py
+      - run: pyinstaller --noconfirm --windowed --name "EDF Viewer" --add-data "EDF_Viewer.html:." --collect-all webview EDFViewerApp.py
       - run: hdiutil create -volname "Ponemah2EDF" -srcfolder "dist/Ponemah2EDF.app" -ov -format UDZO Ponemah2EDF.dmg
+      - run: hdiutil create -volname "EDF Viewer" -srcfolder "dist/EDF Viewer.app" -ov -format UDZO "EDF_Viewer.dmg"
       - uses: actions/upload-artifact@v4
-        with: { name: Ponemah2EDF-macOS, path: Ponemah2EDF.dmg }
+        with: { name: macOS-Apps, path: "*.dmg" }
