@@ -1,0 +1,443 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>EDF Viewer — EP</title>
+<style>
+ :root{--bg:#0f1115;--panel:#1a1d24;--ink:#e7eaf0;--muted:#9aa3b2;--accent:#4ea1ff;--grid:#2a2f3a;--cal:#ffcc44;}
+ *{box-sizing:border-box;} html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:13px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif;}
+ #app{display:flex;flex-direction:column;height:100%;}
+ .bar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:7px 12px;background:var(--panel);border-bottom:1px solid #000;}
+ .bar .g{display:flex;gap:5px;align-items:center;} .bar label{color:var(--muted);}
+ button,select,input[type=text]{background:#262b34;color:var(--ink);border:1px solid #3a4150;border-radius:6px;padding:5px 8px;font:inherit;cursor:pointer;}
+ input[type=text]{width:46px;cursor:text;} button:hover{background:#2f3640;} button.on{background:var(--accent);border-color:var(--accent);color:#04122a;}
+ button.primary{background:#2a7d46;border-color:#2a7d46;color:#eafff0;} button.primary:hover{background:#33914f;}
+ input[type=range]{width:240px;vertical-align:middle;} .sep{width:1px;height:22px;background:#3a4150;}
+ #wrap{flex:1;position:relative;overflow:hidden;} canvas{display:block;width:100%;height:100%;background:var(--bg);cursor:crosshair;}
+ #status{padding:6px 12px;background:var(--panel);border-top:1px solid #000;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap;}
+ #status b{color:var(--ink);} .pill{background:#262b34;border:1px solid #3a4150;border-radius:20px;padding:2px 10px;}
+ .leg{display:inline-flex;gap:10px;margin-left:6px;} .leg span{display:inline-flex;align-items:center;gap:4px;}
+ .dot{width:9px;height:9px;border-radius:50%;display:inline-block;}
+</style></head><body><div id="app">
+ <div class="bar">
+  <div class="g"><input type="file" id="file" accept=".edf,.bdf"></div>
+  <div class="g"><label>Window</label><select id="win"><option value="2">2s</option><option value="5">5s</option><option value="10" selected>10s</option><option value="30">30s</option><option value="60">60s</option><option value="300">5min</option></select></div>
+  <div class="g"><label>Gain</label><button id="gDn">–</button><button id="gUp">+</button><button id="gAuto" class="on">auto</button></div>
+  <div class="g" style="flex:1;min-width:200px;"><button id="back">⟨</button><input type="range" id="scrub" min="0" max="1000" value="0"><button id="fwd">⟩</button></div>
+  <div class="g"><button id="caliper">Caliper</button><button id="png">PNG</button></div>
+ </div>
+ <div class="bar">
+  <div class="g"><label>Display filter</label><select id="filt"><option value="raw">Raw</option><option value="base">Baseline removed</option><option value="band" selected>Bandpass</option></select></div>
+  <div class="g"><label>HP</label><input type="text" id="hp" value="0.5"><label>LP</label><input type="text" id="lp" value="40"><label>Notch</label><select id="notch"><option value="off" selected>off</option><option value="60">60</option><option value="50">50</option></select></div>
+  <div class="sep"></div>
+  <div class="g"><label>ECG</label><select id="ecg"></select></div>
+  <div class="g"><label>P-wave</label><select id="pmode"><option value="coupled" selected>Conducted (P→QRS)</option><option value="independent">Independent (AV dissociation)</option></select></div>
+  <div class="g"><button id="analyze" class="primary">Analyze segment</button><button id="clear">Clear</button><button id="csv">Export CSV</button></div>
+ </div>
+ <div id="wrap"><canvas id="cv"></canvas></div>
+ <div id="status">
+  <span id="fileInfo">Load an .edf file, then drag on the trace to zoom and click “Analyze segment”.</span>
+  <span class="leg"><span><i class="dot" style="background:#ff5d6c"></i>R</span><span><i class="dot" style="background:#46c3ff"></i>P</span><span><i class="dot" style="background:#ffae42"></i>T</span></span>
+  <span class="pill" id="rrInfo"></span><span class="pill" id="ppInfo"></span><span class="pill" id="calInfo"></span>
+ </div>
+</div>
+<script>
+/* edf_detect.js — ECG filtering + QRS/P/T detection (ported from the validated
+   numpy ep_pipeline: NCC template-matching QRS, conducted + independent P-wave
+   detection). Pure JS on Float64Array. Shared by the HTML viewer and node tests. */
+(function (root) {
+"use strict";
+
+function movingAverage(x, w) {
+  const n = x.length, out = new Float64Array(n);
+  if (w <= 1) { out.set(x); return out; }
+  const cs = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) cs[i + 1] = cs[i] + x[i];
+  for (let i = w - 1; i < n; i++) out[i] = (cs[i + 1] - cs[i + 1 - w]) / w;
+  for (let i = 0; i < Math.min(w - 1, n); i++) out[i] = cs[i + 1] / (i + 1);
+  return out;
+}
+function highpass(x, fs, cut) {
+  const w = Math.max(1, Math.round(fs / cut));
+  const base = movingAverage(x, w), out = new Float64Array(x.length);
+  for (let i = 0; i < x.length; i++) out[i] = x[i] - base[i];
+  return out;
+}
+function lowpass(x, fs, cut) { return movingAverage(x, Math.max(Math.round(fs / cut), 3)); }
+function bandpass(x, fs, lo, hi) { return lowpass(highpass(x, fs, lo), fs, hi); }
+function notch(x, fs, f0, Q) {
+  const w0 = 2 * Math.PI * f0 / fs, c = Math.cos(w0), a = Math.sin(w0) / (2 * Q);
+  const b0 = 1, b1 = -2 * c, b2 = 1, a0 = 1 + a, a1 = -2 * c, a2 = 1 - a;
+  const out = new Float64Array(x.length); let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const xi = x[i];
+    const yi = (b0/a0)*xi + (b1/a0)*x1 + (b2/a0)*x2 - (a1/a0)*y1 - (a2/a0)*y2;
+    x2 = x1; x1 = xi; y2 = y1; y1 = yi; out[i] = yi;
+  }
+  return out;
+}
+function percentile(arr, p) {
+  const a = Float64Array.from(arr).sort();
+  const idx = (p / 100) * (a.length - 1), lo = Math.floor(idx), hi = Math.ceil(idx);
+  return lo === hi ? a[lo] : a[lo] + (a[hi] - a[lo]) * (idx - lo);
+}
+function median(arr) { return percentile(arr, 50); }
+
+function detectQRS(ecg, fs, opts) {
+  opts = opts || {};
+  const maxHR = opts.maxHR || 200;
+  const minRR = Math.round(60 / maxHR * fs);
+  const filtered = bandpass(ecg, fs, 1.0, 40.0);
+  const hf = bandpass(ecg, fs, 15.0, 40.0);
+  const N = filtered.length;
+  const hfE = new Float64Array(N);
+  for (let i = 0; i < N; i++) hfE[i] = hf[i] * hf[i];
+  const hfSmooth = movingAverage(hfE, Math.max(3, Math.round(0.05 * fs)));
+  const thr = percentile(hfSmooth, 95);
+  let seeds = [];
+  for (let i = 0; i < N;) {
+    if (hfSmooth[i] > thr) {
+      let pv = hfSmooth[i], pi = i;
+      while (i < N && hfSmooth[i] > thr) { if (hfSmooth[i] > pv) { pv = hfSmooth[i]; pi = i; } i++; }
+      if (!seeds.length || (pi - seeds[seeds.length - 1]) >= minRR) seeds.push(pi);
+    } else i++;
+  }
+  seeds = snapToPeak(seeds, filtered, fs, minRR);
+  if (seeds.length < 5) return makeResult(seeds, fs, filtered, hf);
+  const hw = Math.round(0.06 * fs); const snip = [];
+  for (const p of seeds) if (p - hw >= 0 && p + hw < N) snip.push(filtered.subarray(p - hw, p + hw));
+  if (snip.length < 5) return makeResult(seeds, fs, filtered, hf);
+  const amps = snip.map(s => { let m = 0; for (const v of s) m = Math.max(m, Math.abs(v)); return m; });
+  const ampThr = percentile(Float64Array.from(amps), 30);
+  const tlen = snip[0].length, template = new Float64Array(tlen); let cnt = 0;
+  for (let k = 0; k < snip.length; k++) if (amps[k] >= ampThr) { const s = snip[k]; for (let j = 0; j < tlen; j++) template[j] += s[j]; cnt++; }
+  for (let j = 0; j < tlen; j++) template[j] /= cnt;
+  const ncc = computeNCC(template, filtered);
+  let allPeaks = [];
+  for (let i = 0; i < N;) {
+    if (ncc[i] > 0.3) { let pv = ncc[i], pi = i; while (i < N && ncc[i] > 0.3) { if (ncc[i] > pv) { pv = ncc[i]; pi = i; } i++; } allPeaks.push(pi); }
+    else i++;
+  }
+  const hfHalf = Math.round(0.05 * fs);
+  const score = (p) => { const s = Math.max(0, p - hfHalf), e = Math.min(N, p + hfHalf); let hv = 0; for (let j = s; j < e; j++) hv += hf[j] * hf[j]; return ncc[Math.min(p, N - 1)] * hv; };
+  const scores = allPeaks.map(score);
+  const selMinRR = Math.round(0.45 * fs);
+  const order = scores.map((s, i) => i).sort((a, b) => scores[b] - scores[a]);
+  let selected = [];
+  for (const oi of order) { const p = allPeaks[oi]; let ok = true; for (const s of selected) if (Math.abs(p - s) < selMinRR) { ok = false; break; } if (ok) selected.push(p); }
+  selected.sort((a, b) => a - b);
+  selected = snapToPeak(selected, filtered, fs, minRR);
+  if (selected.length >= 3) { const sc = selected.map(score); const med = median(Float64Array.from(sc)); selected = selected.filter((p, i) => sc[i] >= 0.25 * med); }
+  selected = searchback(selected, ncc, hf, fs, selMinRR);
+  return makeResult(selected, fs, filtered, hf);
+}
+function computeNCC(template, x) {
+  const half = template.length >> 1, tlen = template.length, N = x.length;
+  let tmean = 0; for (const v of template) tmean += v; tmean /= tlen;
+  const tn = new Float64Array(tlen); let tss = 0;
+  for (let j = 0; j < tlen; j++) { tn[j] = template[j] - tmean; tss += tn[j] * tn[j]; }
+  const tstd = Math.sqrt(tss / tlen); const ncc = new Float64Array(N);
+  if (tstd < 1e-10) return ncc;
+  for (let i = half; i < N - half; i++) {
+    let smean = 0; for (let j = -half; j < half; j++) smean += x[i + j]; smean /= tlen;
+    let dot = 0, sss = 0;
+    for (let j = 0; j < tlen; j++) { const sv = x[i - half + j] - smean; dot += tn[j] * sv; sss += sv * sv; }
+    const sstd = Math.sqrt(sss / tlen); if (sstd > 1e-10) ncc[i] = dot / (tlen * tstd * sstd);
+  }
+  return ncc;
+}
+function snapToPeak(cands, filtered, fs, minRR) {
+  const sw = Math.round(0.04 * fs), N = filtered.length; let refined = [];
+  for (const p of cands) { const s = Math.max(0, p - sw), e = Math.min(N, p + sw + 1); let bi = s, bv = -Infinity; for (let j = s; j < e; j++) { const v = Math.abs(filtered[j]); if (v > bv) { bv = v; bi = j; } } refined.push(bi); }
+  refined = Array.from(new Set(refined)).sort((a, b) => a - b);
+  if (!refined.length) return [];
+  const out = [refined[0]];
+  for (let i = 1; i < refined.length; i++) if (refined[i] - out[out.length - 1] >= minRR) out.push(refined[i]);
+  return out;
+}
+function searchback(peaks, ncc, hf, fs, minRR) {
+  if (peaks.length < 2) return peaks;
+  let final = peaks.slice(); const hfHalf = Math.round(0.05 * fs);
+  const hfWin = (p) => { let v = 0; for (let j = Math.max(0, p - hfHalf); j < Math.min(hf.length, p + hfHalf); j++) v += hf[j] * hf[j]; return v; };
+  for (let pass = 0; pass < 3; pass++) {
+    const rr = []; for (let i = 1; i < final.length; i++) rr.push(final[i] - final[i - 1]);
+    if (!rr.length) break;
+    const medRR = median(Float64Array.from(rr));
+    const ref = final.slice(0, 20).map(hfWin); const refMed = ref.length ? median(Float64Array.from(ref)) : 0;
+    const add = [];
+    for (let i = 0; i < final.length - 1; i++) {
+      const gap = final[i + 1] - final[i];
+      if (gap > 1.5 * medRR && gap > minRR * 2) {
+        const ss = final[i] + minRR, se = final[i + 1] - minRR;
+        if (ss < se && se <= ncc.length) {
+          let bi = ss, bv = -Infinity; for (let j = ss; j < se; j++) if (ncc[j] > bv) { bv = ncc[j]; bi = j; }
+          if (bv > 0.5 && hfWin(bi) > 0.01 * refMed) add.push(bi);
+        }
+      }
+    }
+    if (!add.length) break;
+    final = Array.from(new Set(final.concat(add))).sort((a, b) => a - b);
+  }
+  return final;
+}
+function makeResult(peaks, fs, filtered, hf) {
+  peaks = Array.from(new Set(peaks)).sort((a, b) => a - b);
+  const rr = []; for (let i = 1; i < peaks.length; i++) rr.push((peaks[i] - peaks[i - 1]) / fs * 1000);
+  return { peaks, rr_ms: rr, n: peaks.length, filtered, hf };
+}
+
+function detectPCoupled(ecg, fs, qrsPeaks) {
+  const pBand = bandpass(ecg, fs, 1.0, 8.0); const N = pBand.length;
+  const blanked = Float64Array.from(pBand);
+  const bp = Math.round(0.06 * fs), bpo = Math.round(0.30 * fs);
+  for (const q of qrsPeaks) { const s = Math.max(0, q - bp), e = Math.min(N, q + bpo); for (let j = s; j < e; j++) blanked[j] = 0; }
+  const preMin = Math.round(0.08 * fs), preMax = Math.round(0.50 * fs);
+  const peaks = [], pr = [];
+  for (let qi = 0; qi < qrsPeaks.length; qi++) {
+    const q = qrsPeaks[qi]; let ws = q - preMax, we = q - preMin;
+    if (qi > 0) ws = Math.max(ws, qrsPeaks[qi - 1] + bpo);
+    if (ws < 0 || ws >= we || we > N) continue;
+    let bi = ws, bv = -Infinity;
+    for (let j = ws; j < we; j++) { const v = Math.abs(blanked[j]); if (v > bv) { bv = v; bi = j; } }
+    if (bv > 0.005) { const prMs = (q - bi) / fs * 1000; if (prMs >= 80 && prMs <= 500) { peaks.push(bi); pr.push(prMs); } }
+  }
+  const pp = []; for (let i = 1; i < peaks.length; i++) pp.push((peaks[i] - peaks[i - 1]) / fs * 1000);
+  return { peaks, pp_ms: pp, pr_ms: pr, n: peaks.length, pBand };
+}
+
+function detectPIndependent(ecg, fs, qrsPeaks, opts) {
+  opts = opts || {};
+  const blankPostS = opts.blankPost || 0.45, thrPct = opts.thrPct || 80, thrFac = opts.thrFac || 1.0, minPPS = opts.minPP || 0.33;
+  const pBand = bandpass(ecg, fs, 1.0, 8.0); const N = pBand.length;
+  const blanked = Float64Array.from(pBand);
+  const bp = Math.round(0.06 * fs), bpo = Math.round(blankPostS * fs);
+  for (const q of qrsPeaks) { const s = Math.max(0, q - bp), e = Math.min(N, q + bpo); for (let j = s; j < e; j++) blanked[j] = 0; }
+  const absB = new Float64Array(N); for (let i = 0; i < N; i++) absB[i] = Math.abs(blanked[i]);
+  const win = Math.round(5.0 * fs), step = win >> 1, minPP = Math.round(minPPS * fs);
+  const peaks = [];
+  for (let start = 0; start + win < N; start += step) {
+    const seg = absB.subarray(start, start + win);
+    const thr = percentile(seg, thrPct) * thrFac;
+    if (thr < 0.004) continue;
+    for (let i = 0; i < seg.length;) {
+      if (seg[i] > thr) {
+        let pv = seg[i], pi = i; while (i < seg.length && seg[i] > thr) { if (seg[i] > pv) { pv = seg[i]; pi = i; } i++; }
+        const cand = start + pi;
+        if (blanked[cand] !== 0 && (!peaks.length || cand - peaks[peaks.length - 1] >= minPP)) peaks.push(cand);
+      } else i++;
+    }
+  }
+  const uniq = Array.from(new Set(peaks)).sort((a, b) => a - b);
+  const pp = []; for (let i = 1; i < uniq.length; i++) pp.push((uniq[i] - uniq[i - 1]) / fs * 1000);
+  return { peaks: uniq, pp_ms: pp, n: uniq.length, pBand };
+}
+
+function detectT(ecg, fs, qrsPeaks) {
+  const tBand = bandpass(ecg, fs, 0.5, 10.0); const N = tBand.length;
+  const t0 = Math.round(0.15 * fs), t1 = Math.round(0.40 * fs); const peaks = [];
+  for (const q of qrsPeaks) { const s = q + t0, e = Math.min(N, q + t1); if (s >= e) continue; let bi = s, bv = -Infinity; for (let j = s; j < e; j++) { const v = Math.abs(tBand[j]); if (v > bv) { bv = v; bi = j; } } peaks.push(bi); }
+  return { peaks, n: peaks.length };
+}
+
+const API = { movingAverage, highpass, lowpass, bandpass, notch, percentile, median,
+              detectQRS, detectPCoupled, detectPIndependent, detectT, computeNCC };
+if (typeof module !== "undefined" && module.exports) module.exports = API;
+root.EDFDetect = API;
+})(typeof self !== "undefined" ? self : this);
+
+"use strict";
+// ---------- EDF parser (validated == pyedflib) ----------
+function parseEDF(buf){
+  const dv=new DataView(buf), td=new TextDecoder("ascii");
+  const A=(o,l)=>td.decode(new Uint8Array(buf,o,l)).trim();
+  const startDate=A(168,8),startTime=A(176,8),headerBytes=parseInt(A(184,8),10);
+  const numRecords=parseInt(A(236,8),10),recDur=parseFloat(A(244,8)),ns=parseInt(A(252,4),10);
+  let o=256;const rd=l=>{const s=A(o,l);o+=l;return s;};
+  const lab=[],dim=[],pmin=[],pmax=[],dmin=[],dmax=[],spr=[];
+  for(let i=0;i<ns;i++)lab.push(rd(16));for(let i=0;i<ns;i++)rd(80);
+  for(let i=0;i<ns;i++)dim.push(rd(8));for(let i=0;i<ns;i++)pmin.push(parseFloat(rd(8)));
+  for(let i=0;i<ns;i++)pmax.push(parseFloat(rd(8)));for(let i=0;i<ns;i++)dmin.push(parseInt(rd(8),10));
+  for(let i=0;i<ns;i++)dmax.push(parseInt(rd(8),10));for(let i=0;i<ns;i++)rd(80);
+  for(let i=0;i<ns;i++)spr.push(parseInt(rd(8),10));
+  const recBytes=spr.reduce((a,b)=>a+b,0)*2;const sigOff=[];let acc=0;
+  for(let i=0;i<ns;i++){sigOff.push(acc*2);acc+=spr[i];}
+  const dataStart=headerBytes;const signals=[];
+  for(let i=0;i<ns;i++){const isAnn=lab[i].replace(/\s+/g,"").toLowerCase()==="edfannotations";
+    signals.push({index:i,label:lab[i]||("ch"+i),unit:dim[i],spr:spr[i],fs:spr[i]/recDur,
+      physMin:pmin[i],digMin:dmin[i],scale:(pmax[i]-pmin[i])/(dmax[i]-dmin[i]),
+      offsetInRec:sigOff[i],isAnnotation:isAnn,nSamples:numRecords*spr[i]});}
+  function sampleAt(sig,k){const r=(k/sig.spr)|0,w=k-r*sig.spr;
+    const byte=dataStart+r*recBytes+sig.offsetInRec+w*2;return sig.physMin+(dv.getInt16(byte,true)-sig.digMin)*sig.scale;}
+  return {startDate,startTime,numRecords,recDur,ns,signals,durationSec:numRecords*recDur,sampleAt};
+}
+function getSegment(sig,kA,kB){const n=kB-kA,out=new Float64Array(n);for(let k=0;k<n;k++)out[k]=edf.sampleAt(sig,kA+k);return out;}
+
+// ---------- state ----------
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+let edf=null,plotSignals=[],winSec=10,t0=0,gainMul={},autoGain=true;
+let caliperMode=false,calPts=[];
+let dragging=false,dragX0=null,dragX1=null;
+let ecgIdx=null,pMode="coupled";
+let R=[],P=[],T=[],RR=[],PP=[],PR=[];   // times in seconds / ms
+const $=id=>document.getElementById(id);
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function fitCanvas(){const r=cv.parentElement.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
+  cv.width=Math.max(300,r.width*dpr);cv.height=Math.max(200,r.height*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);draw();}
+window.addEventListener("resize",fitCanvas);
+
+function layout(){const W=cv.clientWidth,H=cv.clientHeight,padL=70,padR=12,padT=8,padB=18;
+  const n=plotSignals.length||1,laneH=(H-padT-padB)/n;return {W,H,padL,padR,padT,padB,laneH,plotW:W-padL-padR};}
+
+// display filter applied to a window (with padding for MA context)
+function displayFilter(arr,fs){
+  const mode=$("filt").value;
+  let y=arr;
+  if(mode==="base"||mode==="band") y=EDFDetect.highpass(y,fs,parseFloat($("hp").value)||0.5);
+  if(mode==="band") y=EDFDetect.lowpass(y,fs,parseFloat($("lp").value)||40);
+  const nf=$("notch").value; if(nf!=="off") y=EDFDetect.notch(y,fs,parseFloat(nf),20);
+  return y;
+}
+
+function draw(){
+  const L=layout();ctx.clearRect(0,0,L.W,L.H);if(!edf)return;
+  const t1=t0+winSec;ctx.lineWidth=1;
+  plotSignals.forEach((sig,li)=>{
+    const yTop=L.padT+li*L.laneH,yMid=yTop+L.laneH/2;
+    ctx.strokeStyle=css("--grid");ctx.beginPath();ctx.moveTo(L.padL,yTop);ctx.lineTo(L.W-L.padR,yTop);ctx.stroke();
+    const step=winSec<=10?1:(winSec<=60?5:(winSec<=300?30:60));
+    ctx.strokeStyle="#20242e";
+    for(let t=Math.ceil(t0);t<t1;t+=step){const x=L.padL+(t-t0)/winSec*L.plotW;ctx.beginPath();ctx.moveTo(x,yTop);ctx.lineTo(x,yTop+L.laneH);ctx.stroke();}
+    ctx.fillStyle=css("--ink");ctx.font="12px system-ui";ctx.fillText(sig.label,6,yTop+14);
+    ctx.fillStyle=css("--muted");ctx.font="10px system-ui";ctx.fillText(sig.unit+" "+(sig.fs|0)+"Hz",6,yTop+28);
+    const fs=sig.fs;let kA=Math.max(0,Math.floor(t0*fs)),kB=Math.min(sig.nSamples-1,Math.ceil(t1*fs));
+    if(kB<=kA)return;
+    // fetch window (+pad) and optionally filter
+    const pad=Math.min(kA,Math.round(fs*2));
+    let seg=getSegment(sig,kA-pad,kB+1);
+    if($("filt").value!=="raw") seg=displayFilter(seg,fs);
+    seg=seg.subarray(pad);
+    let mn=Infinity,mx=-Infinity;const stride=Math.max(1,Math.floor(seg.length/2000));
+    for(let k=0;k<seg.length;k+=stride){if(seg[k]<mn)mn=seg[k];if(seg[k]>mx)mx=seg[k];}
+    const span=(mx-mn)||1;let g=autoGain?(L.laneH*0.8)/span:(gainMul[sig.index]||(L.laneH*0.8)/span);
+    gainMul[sig.index]=g;const mid=(mn+mx)/2;
+    ctx.strokeStyle=sig.label.toLowerCase().includes("ecg")?"#7ee0a0":css("--accent");
+    ctx.beginPath();const px2k=seg.length/L.plotW;
+    if(px2k>1.5){for(let px=0;px<L.plotW;px++){const a=Math.floor(px*px2k),b=Math.min(seg.length-1,Math.floor((px+1)*px2k));
+      let lo=Infinity,hi=-Infinity;for(let k=a;k<=b;k++){if(seg[k]<lo)lo=seg[k];if(seg[k]>hi)hi=seg[k];}
+      const x=L.padL+px;ctx.moveTo(x,yMid-(hi-mid)*g);ctx.lineTo(x,yMid-(lo-mid)*g);}}
+    else{for(let k=0;k<seg.length;k++){const x=L.padL+k/(seg.length-1)*L.plotW;const y=yMid-(seg[k]-mid)*g;if(k===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}}
+    ctx.stroke();
+    // markers only on the ECG channel that was analyzed
+    if(sig.index===ecgIdx){
+      drawMarks(R,"#ff5d6c",yTop+10,L,"R");
+      drawMarks(P,"#46c3ff",yTop+22,L,"P");
+      drawMarks(T,"#ffae42",yTop+L.laneH-8,L,"T");
+    }
+  });
+  // axis labels
+  ctx.fillStyle=css("--muted");ctx.font="10px system-ui";
+  const step=winSec<=10?1:(winSec<=60?5:(winSec<=300?30:60));
+  for(let t=Math.ceil(t0);t<t0+winSec;t+=step){const x=L.padL+(t-t0)/winSec*L.plotW;ctx.fillText(fmtTime(t),x+2,L.H-4);}
+  // caliper
+  if(calPts.length){ctx.strokeStyle=css("--cal");ctx.setLineDash([4,3]);
+    calPts.forEach(p=>{if(p.t<t0||p.t>t0+winSec)return;const x=L.padL+(p.t-t0)/winSec*L.plotW;ctx.beginPath();ctx.moveTo(x,L.padT);ctx.lineTo(x,L.H-12);ctx.stroke();});ctx.setLineDash([]);}
+  // drag-zoom rubber band
+  if(dragging&&dragX0!=null&&dragX1!=null){ctx.fillStyle="rgba(78,161,255,0.18)";const x=Math.min(dragX0,dragX1);ctx.fillRect(x,L.padT,Math.abs(dragX1-dragX0),L.H-L.padT-L.padB);}
+}
+function drawMarks(times,color,y,L,lbl){ctx.fillStyle=color;ctx.strokeStyle=color;
+  for(const tt of times){if(tt<t0||tt>t0+winSec)continue;const x=L.padL+(tt-t0)/winSec*L.plotW;ctx.beginPath();ctx.arc(x,y,3,0,7);ctx.fill();}}
+
+function fmtTime(s){s=Math.max(0,s);const hh=Math.floor(s/3600),mm=Math.floor((s%3600)/60),ss=s%60;
+  const ssS=winSec<=10?ss.toFixed(1):Math.floor(ss).toString().padStart(2,"0");
+  return hh>0?`${hh}:${mm.toString().padStart(2,"0")}:${ssS.padStart(2,"0")}`:`${mm}:${ssS.padStart(2,"0")}`;}
+
+// ---------- analysis ----------
+function analyze(){
+  if(!edf||ecgIdx==null)return;
+  const sig=plotSignals.find(s=>s.index===ecgIdx);if(!sig)return;
+  const fs=sig.fs;const kA=Math.max(0,Math.floor(t0*fs)),kB=Math.min(sig.nSamples,Math.ceil((t0+winSec)*fs));
+  if(kB-kA>500000){setStatus("Zoom in to ≤ ~"+Math.round(500000/fs)+" s to analyze.");return;}
+  const ecg=getSegment(sig,kA,kB);
+  setStatus("Analyzing "+(winSec.toFixed(0))+" s …");
+  setTimeout(()=>{
+    const q=EDFDetect.detectQRS(ecg,fs);
+    const off=kA/fs;
+    R=q.peaks.map(p=>off+p/fs);RR=q.rr_ms.slice();
+    let pres;
+    if(pMode==="independent")pres=EDFDetect.detectPIndependent(ecg,fs,q.peaks);
+    else pres=EDFDetect.detectPCoupled(ecg,fs,q.peaks);
+    P=pres.peaks.map(p=>off+p/fs);PP=pres.pp_ms.slice();PR=pres.pr_ms?pres.pr_ms.slice():[];
+    const tr=EDFDetect.detectT(ecg,fs,q.peaks);T=tr.peaks.map(p=>off+p/fs);
+    reportStats();draw();
+  },20);
+}
+function stats(a){if(!a.length)return null;const s=Float64Array.from(a);const m=a.reduce((x,y)=>x+y,0)/a.length;
+  return {n:a.length,mean:m,median:EDFDetect.median(s),min:Math.min(...a),max:Math.max(...a)};}
+function reportStats(){
+  const r=stats(RR),p=stats(PP);
+  let html="";
+  if(r)html+=`<b>RR</b>: ${R.length} beats · mean ${r.mean.toFixed(0)} · median ${r.median.toFixed(0)} ms · HR ${(60000/r.median).toFixed(0)} bpm`;
+  else html+="No QRS detected";
+  $("rrInfo").innerHTML=html;
+  let h2="";
+  if(p)h2=`<b>PP</b>: ${P.length} P-waves · mean ${p.mean.toFixed(0)} · median ${p.median.toFixed(0)} ms · atrial ${(60000/p.median).toFixed(0)} bpm`;
+  if(PR&&PR.length){const pr=stats(PR);h2+=`  ·  <b>PR</b> mean ${pr.mean.toFixed(0)} ms`;}
+  $("ppInfo").innerHTML=h2;
+}
+function clearAnalysis(){R=[];P=[];T=[];RR=[];PP=[];PR=[];$("rrInfo").textContent="";$("ppInfo").textContent="";draw();}
+
+function exportCSV(){
+  let s="# EDF Viewer beat measurements\n# generated "+new Date().toISOString()+"\n";
+  s+="\n# QRS / R-wave (RR = interval from previous R)\nbeat,R_time_s,RR_ms,T_time_s\n";
+  for(let i=0;i<R.length;i++)s+=`${i+1},${R[i].toFixed(4)},${i>0?Math.round((R[i]-R[i-1])*1000):""},${T[i]!=null?T[i].toFixed(4):""}\n`;
+  s+="\n# P-wave (PP = interval from previous P; PR present in Conducted mode)\np_index,P_time_s,PP_ms"+(PR.length?",PR_ms":"")+"\n";
+  for(let i=0;i<P.length;i++)s+=`${i+1},${P[i].toFixed(4)},${i>0?Math.round((P[i]-P[i-1])*1000):""}${PR.length?(","+(PR[i]!=null?Math.round(PR[i]):"")):""}\n`;
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([s],{type:"text/csv"}));
+  a.download="beat_measurements.csv";a.click();
+}
+
+// ---------- UI wiring ----------
+function setStatus(m){$("fileInfo").textContent=m;}
+$("file").addEventListener("change",e=>{const f=e.target.files[0];if(!f)return;const fr=new FileReader();
+  setStatus("Loading "+f.name+" …");
+  fr.onload=()=>{try{edf=parseEDF(fr.result);plotSignals=edf.signals.filter(s=>!s.isAnnotation&&s.spr>0);
+    t0=0;winSec=parseFloat($("win").value);gainMul={};clearAnalysis();
+    const sel=$("ecg");sel.innerHTML="";plotSignals.forEach(s=>{const o=document.createElement("option");o.value=s.index;o.textContent=s.label;sel.appendChild(o);});
+    const e1=plotSignals.find(s=>s.label.toLowerCase().includes("ecg"))||plotSignals[0];ecgIdx=e1?e1.index:null;if(ecgIdx!=null)sel.value=ecgIdx;
+    $("fileInfo").innerHTML=`<b>${f.name}</b> · ${edf.signals.length} sig · ${edf.durationSec.toFixed(1)} s · start ${edf.startDate} ${edf.startTime}`;
+    updateScrub();fitCanvas();}catch(err){setStatus("Could not read EDF: "+err.message);console.error(err);}};
+  fr.readAsArrayBuffer(f);});
+$("win").addEventListener("change",()=>{const c=t0+winSec/2;winSec=parseFloat($("win").value);t0=clamp(c-winSec/2);updateScrub();draw();});
+$("filt").addEventListener("change",draw);$("hp").addEventListener("change",draw);$("lp").addEventListener("change",draw);$("notch").addEventListener("change",draw);
+$("gUp").onclick=()=>{autoGain=false;plotSignals.forEach(s=>gainMul[s.index]=(gainMul[s.index]||1)*1.3);draw();};
+$("gDn").onclick=()=>{autoGain=false;plotSignals.forEach(s=>gainMul[s.index]=(gainMul[s.index]||1)/1.3);draw();};
+$("gAuto").onclick=()=>{autoGain=true;draw();};
+$("back").onclick=()=>{t0=clamp(t0-winSec*0.5);updateScrub();draw();};
+$("fwd").onclick=()=>{t0=clamp(t0+winSec*0.5);updateScrub();draw();};
+$("scrub").addEventListener("input",()=>{if(!edf)return;t0=clamp($("scrub").value/1000*Math.max(0,edf.durationSec-winSec));draw();});
+$("caliper").onclick=()=>{caliperMode=!caliperMode;calPts=[];$("caliper").classList.toggle("on",caliperMode);$("calInfo").textContent=caliperMode?"Caliper: click two points":"";draw();};
+$("ecg").addEventListener("change",()=>{ecgIdx=parseInt($("ecg").value,10);});
+$("pmode").addEventListener("change",()=>{pMode=$("pmode").value;});
+$("analyze").onclick=analyze;$("clear").onclick=clearAnalysis;$("csv").onclick=exportCSV;
+$("png").onclick=()=>{const a=document.createElement("a");a.href=cv.toDataURL("image/png");a.download="edf_view.png";a.click();};
+
+// mouse: caliper click OR drag-to-zoom
+cv.addEventListener("mousedown",e=>{if(!edf||caliperMode)return;dragging=true;dragX0=e.clientX-cv.getBoundingClientRect().left;dragX1=dragX0;});
+cv.addEventListener("mousemove",e=>{if(dragging){dragX1=e.clientX-cv.getBoundingClientRect().left;draw();}});
+window.addEventListener("mouseup",()=>{if(!dragging)return;dragging=false;const L=layout();
+  if(dragX0!=null&&dragX1!=null&&Math.abs(dragX1-dragX0)>6){
+    const f0=(Math.min(dragX0,dragX1)-L.padL)/L.plotW,f1=(Math.max(dragX0,dragX1)-L.padL)/L.plotW;
+    const nt0=t0+Math.max(0,f0)*winSec,nt1=t0+Math.min(1,f1)*winSec;
+    winSec=Math.max(0.2,nt1-nt0);t0=clamp(nt0);$("win").value=nearestWin(winSec);updateScrub();}
+  dragX0=dragX1=null;draw();});
+cv.addEventListener("click",e=>{if(!edf||!caliperMode)return;const L=layout();const x=e.clientX-cv.getBoundingClientRect().left;
+  const t=t0+(x-L.padL)/L.plotW*winSec;if(t<t0||t>t0+winSec)return;calPts.push({t});if(calPts.length>2)calPts=[calPts[calPts.length-1]];
+  if(calPts.length===2){const dt=Math.abs(calPts[1].t-calPts[0].t);$("calInfo").innerHTML=`Δt <b>${(dt*1000).toFixed(1)} ms</b> · <b>${(60/dt).toFixed(1)}</b> bpm`;}
+  else $("calInfo").textContent="Caliper: click second point";draw();});
+window.addEventListener("keydown",e=>{if(!edf)return;
+  if(e.key==="ArrowLeft"){t0=clamp(t0-winSec*0.25);updateScrub();draw();}
+  if(e.key==="ArrowRight"){t0=clamp(t0+winSec*0.25);updateScrub();draw();}});
+
+function clamp(t){const mx=Math.max(0,edf?edf.durationSec-winSec:0);return Math.min(mx,Math.max(0,t));}
+function updateScrub(){const mx=Math.max(0,edf?edf.durationSec-winSec:0);$("scrub").value=mx>0?Math.round(t0/mx*1000):0;}
+function nearestWin(w){const opts=[2,5,10,30,60,300];let best=opts[0];for(const o of opts)if(Math.abs(o-w)<Math.abs(best-w))best=o;return best;}
+
+</script></body></html>
